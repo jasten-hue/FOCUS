@@ -38,7 +38,7 @@ jobs:
           Copy-Item focus_icon.ico desktop/focus_icon.ico
           if (Test-Path chart.umd.min.js) { Copy-Item chart.umd.min.js desktop/chart.umd.min.js }
 
-            - name: Build app with PyInstaller
+      - name: Build app with PyInstaller
         working-directory: desktop
         run: |
           $data = @("--add-data", "index.html;.", "--add-data", "focus_icon.ico;.")
