@@ -1,0 +1,67 @@
+name: Build Windows Installer
+
+# The installer only wraps the live Vercel site, so index.html changes do NOT
+# trigger a build. Rebuild only when the desktop shell changes, when you push a
+# version tag (v1.0.0), or when you run it manually.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "desktop/**"
+      - ".github/workflows/build-installer.yml"
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: python -m pip install pywebview pyinstaller
+
+      - name: Copy offline-fallback files into desktop/
+        run: |
+          Copy-Item index.html desktop/index.html
+          if (Test-Path chart.umd.min.js) { Copy-Item chart.umd.min.js desktop/chart.umd.min.js }
+
+      - name: Build app with PyInstaller
+        working-directory: desktop
+        run: |
+          $data = @("--add-data", "index.html;.")
+          if (Test-Path chart.umd.min.js) { $data += @("--add-data", "chart.umd.min.js;.") }
+          pyinstaller --noconfirm --onedir --windowed --name FocusTestLogAnalyzer @data app.py
+
+      - name: Install Inno Setup
+        run: choco install innosetup -y --no-progress
+
+      - name: Build installer
+        working-directory: desktop
+        run: |
+          $version = "1.0.0"
+          if ($env:GITHUB_REF -like "refs/tags/v*") { $version = $env:GITHUB_REF_NAME.TrimStart("v") }
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" "/DAppVersion=$version" installer.iss
+
+      - name: Upload installer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: FocusTestLogAnalyzer-Setup
+          path: desktop/Output/FocusTestLogAnalyzer-Setup.exe
+
+      - name: Attach installer to GitHub Release (tags only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: desktop/Output/FocusTestLogAnalyzer-Setup.exe
