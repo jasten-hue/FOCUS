@@ -35,14 +35,15 @@ jobs:
       - name: Copy offline-fallback files into desktop/
         run: |
           Copy-Item index.html desktop/index.html
+          Copy-Item focus_icon.ico desktop/focus_icon.ico
           if (Test-Path chart.umd.min.js) { Copy-Item chart.umd.min.js desktop/chart.umd.min.js }
 
-      - name: Build app with PyInstaller
+            - name: Build app with PyInstaller
         working-directory: desktop
         run: |
-          $data = @("--add-data", "index.html;.")
+          $data = @("--add-data", "index.html;.", "--add-data", "focus_icon.ico;.")
           if (Test-Path chart.umd.min.js) { $data += @("--add-data", "chart.umd.min.js;.") }
-          pyinstaller --noconfirm --onedir --windowed --name FocusTestLogAnalyzer @data app.py
+          pyinstaller --noconfirm --onedir --windowed --name FocusTestLogAnalyzer --icon focus_icon.ico @data app.py
 
       - name: Install Inno Setup
         run: choco install innosetup -y --no-progress
