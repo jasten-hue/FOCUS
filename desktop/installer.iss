@@ -14,6 +14,7 @@ Compression=lzma2
 SolidCompression=yes
 PrivilegesRequired=lowest
 ArchitecturesInstallIn64BitMode=x64compatible
+SetupIconFile=focus_icon.ico
 UninstallDisplayIcon={app}\FocusTestLogAnalyzer.exe
 
 [Tasks]
@@ -23,8 +24,8 @@ Name: "desktopicon"; Description: "Create a desktop shortcut"; Flags: unchecked
 Source: "dist\FocusTestLogAnalyzer\*"; DestDir: "{app}"; Flags: recursesubdirs ignoreversion
 
 [Icons]
-Name: "{group}\Focus Test Log Analyzer"; Filename: "{app}\FocusTestLogAnalyzer.exe"
-Name: "{autodesktop}\Focus Test Log Analyzer"; Filename: "{app}\FocusTestLogAnalyzer.exe"; Tasks: desktopicon
+Name: "{group}\Focus Test Log Analyzer"; Filename: "{app}\FocusTestLogAnalyzer.exe"; IconFilename: "{app}\FocusTestLogAnalyzer.exe"
+Name: "{autodesktop}\Focus Test Log Analyzer"; Filename: "{app}\FocusTestLogAnalyzer.exe"; IconFilename: "{app}\FocusTestLogAnalyzer.exe"; Tasks: desktopicon
 
 [Run]
 Filename: "{app}\FocusTestLogAnalyzer.exe"; Description: "Launch Focus Test Log Analyzer"; Flags: nowait postinstall skipifsilent
