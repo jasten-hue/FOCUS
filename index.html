@@ -376,7 +376,9 @@ button,
 .cpk-summary .cpk-note { font-size: 11px; color: #6b7280; margin-bottom: 8px; }
 .cpk-scroll { max-height: 360px; overflow: auto; border: 1px solid #e5e7eb; border-radius: 8px; }
 .cpk-table { width: 100%; border-collapse: collapse; font-size: 12px; }
-.cpk-table th { position: sticky; top: 0; background: #f9fafb; text-align: left; padding: 6px 8px; border-bottom: 2px solid #e5e7eb; }
+.cpk-table th { position: sticky; top: 0; background: #f9fafb; color: #334155; text-align: left; padding: 6px 8px; border-bottom: 2px solid #e5e7eb; white-space: nowrap; z-index: 2; }
+.cpk-table td:first-child, .cpk-table th:first-child { position: sticky; left: 0; background: #fff; z-index: 1; }
+.cpk-table th:first-child { background: #f9fafb; z-index: 3; }
 .cpk-table td { padding: 5px 8px; border-bottom: 1px solid #f1f1f1; }
 .cpk-table td.num, .cpk-table th.num { text-align: right; font-variant-numeric: tabular-nums; }
 .cpk-bad  { background: #fee2e2; color: #b91c1c; font-weight: 600; }
@@ -1727,6 +1729,7 @@ let cpkBySource = {};
 /* Cpk table controls (kept across re-analysis / source filter changes) */
 let cpkModeFilter = "BOTH";      // "BOTH" | "DAY" | "NIGHT"
 let cpkSortOrder = "CPK_ASC";    // "CPK_ASC" | "CPK_DESC" | "NAME"
+let cpkViewMode = "TOTAL";       // "TOTAL" | "BATCH" | "FIXTURE"
 
 
 /*
@@ -3311,8 +3314,21 @@ function buildNGSummaryData(records) {
 ============================================================ */
 
 /* ============================================================
-   CPK (read from the CSV "Cpk" row - never calculated)
+   CPK (calculated from the uploaded measurements)
+
+   Nothing is read from the CSV's Mean / Sigma / CpL / CpU / Cpk
+   rows any more. Only the Lower / Upper limit rows are used.
+
+     CpL = (mean - Lower) / (3 * sigma)
+     CpU = (Upper - mean) / (3 * sigma)
+     Cpk = min(CpL, CpU)   (only CpL when there is no Upper limit)
+
+   Every measurement is included (0 values too), so the result
+   matches the CSV's own Mean / Sigma rows.
 ============================================================ */
+
+/* true = sample sigma (n-1, Excel STDEV.S) | false = population sigma (n, STDEV.P) */
+var CPK_USE_SAMPLE_SIGMA = true;
 
 var CPK_MODE_LABELS = { BOTH: "Both", DAY: "Day Mode", NIGHT: "Night Mode" };
 var CPK_SORT_LABELS = {
@@ -3320,72 +3336,169 @@ var CPK_SORT_LABELS = {
     CPK_DESC: "Highest Cpk first",
     NAME: "Item name (A-Z)"
 };
+var CPK_VIEW_LABELS = {
+    TOTAL: "Total Cpk",
+    BATCH: "Cpk per Batch",
+    FIXTURE: "Cpk per Fixture"
+};
 
-function getCpkTableData() {
+function cpkIsNum(v) {
+    return typeof v === "number" && isFinite(v);
+}
 
-    const labels = Object.keys(cpkBySource).filter(function(label) {
-        return activeSourceFile === "ALL" || label === activeSourceFile;
-    });
+function calcCpkStats(values, lower, upper) {
 
-    if (!labels.length) return null;
+    const n = values.length;
+    const out = { n: n, mean: null, sigma: null, cpl: null, cpu: null, cpk: null };
 
-    const byName = {};
-    const order = [];
+    if (!n) return out;
 
-    labels.forEach(function(label) {
-        cpkBySource[label].forEach(function(item) {
-            if (!byName[item.name]) {
-                byName[item.name] = {
-                    name: item.name,
-                    type: getMTFType(item.name),
-                    lower: item.lower,
-                    mean: item.mean,
-                    sigma: item.sigma,
-                    cpk: {}
-                };
-                order.push(item.name);
-            }
-            byName[item.name].cpk[label] = item.cpk;
-            if (byName[item.name].lower === null) byName[item.name].lower = item.lower;
-        });
-    });
+    let sum = 0;
+    for (let i = 0; i < n; i++) sum += values[i];
+    const mean = sum / n;
+    out.mean = mean;
 
-    function minCpk(row) {
-        let m = null;
-        labels.forEach(function(label) {
-            const v = row.cpk[label];
-            if (v !== null && v !== undefined && (m === null || v < m)) m = v;
-        });
-        return m;
+    if (n < 2) return out;
+
+    let ss = 0;
+    for (let i = 0; i < n; i++) {
+        const d = values[i] - mean;
+        ss += d * d;
     }
+    const sigma = Math.sqrt(ss / (CPK_USE_SAMPLE_SIGMA ? n - 1 : n));
+    out.sigma = sigma;
 
-    const allRows = order.map(function(n) { return byName[n]; });
+    if (!(sigma > 0)) return out;
 
-    // Day / Night / Both
-    const rows = allRows.filter(function(row) {
+    const hasL = cpkIsNum(lower);
+    const hasU = cpkIsNum(upper);
+
+    if (hasL) out.cpl = (mean - lower) / (3 * sigma);
+    if (hasU) out.cpu = (upper - mean) / (3 * sigma);
+
+    if (hasL && hasU) out.cpk = Math.min(out.cpl, out.cpu);
+    else if (hasL) out.cpk = out.cpl;
+    else if (hasU) out.cpk = out.cpu;
+
+    return out;
+}
+
+/*
+ * view: "TOTAL" (everything together) | "BATCH" (one column per
+ * uploaded file) | "FIXTURE" (one column per Station IP).
+ * Uses the records currently on screen (respects the Source File filter).
+ */
+function getCpkTableData(viewOverride) {
+
+    const view = viewOverride || cpkViewMode;
+    const records = originalRecords || [];
+
+    if (!records.length) return null;
+
+    const meta = {};
+    const itemOrder = [];
+    const acc = {};
+    const labels = [];
+
+    records.forEach(function(rec) {
+
+        let label;
+        if (view === "BATCH") label = rec.__sourceFile || "Unknown source";
+        else if (view === "FIXTURE") label = String(rec.stationIP || "").trim() || "UNKNOWN";
+        else label = "Total";
+
+        if (!acc[label]) {
+            acc[label] = {};
+            labels.push(label);
+        }
+
+        (rec.measurements || []).forEach(function(m) {
+
+            if (!cpkIsNum(m.value)) return;
+
+            if (!meta[m.name]) {
+                meta[m.name] = { name: m.name, type: getMTFType(m.name), lower: null, upper: null };
+                itemOrder.push(m.name);
+            }
+            const mt = meta[m.name];
+            if (mt.lower === null && cpkIsNum(m.lower)) mt.lower = m.lower;
+            if (mt.upper === null && cpkIsNum(m.upper)) mt.upper = m.upper;
+
+            let a = acc[label][m.name];
+            if (!a) {
+                a = acc[label][m.name] = { vals: [], lower: null, upper: null };
+            }
+            if (a.lower === null && cpkIsNum(m.lower)) a.lower = m.lower;
+            if (a.upper === null && cpkIsNum(m.upper)) a.upper = m.upper;
+            a.vals.push(m.value);
+        });
+    });
+
+    if (!itemOrder.length) return null;
+
+    if (view === "FIXTURE") labels.sort(naturalCompare);
+
+    let rows = itemOrder.map(function(name) {
+
+        const mt = meta[name];
+        const stats = {};
+        const cpk = {};
+
+        labels.forEach(function(label) {
+            const a = acc[label][name];
+            if (!a) {
+                stats[label] = null;
+                cpk[label] = null;
+                return;
+            }
+            const st = calcCpkStats(a.vals, a.lower, a.upper);
+            stats[label] = st;
+            cpk[label] = st.cpk;
+        });
+
+        return {
+            name: name,
+            type: mt.type,
+            lower: mt.lower,
+            upper: mt.upper,
+            stats: stats,
+            cpk: cpk
+        };
+    });
+
+    const totalItems = rows.length;
+    const hasUpper = rows.some(function(r) { return r.upper !== null; });
+
+    rows = rows.filter(function(row) {
         return cpkModeFilter === "BOTH" || row.type === cpkModeFilter;
     });
 
-    rows.sort(function(a, b) {
+    function minCpk(row) {
+        let best = null;
+        labels.forEach(function(label) {
+            const v = row.cpk[label];
+            if (v !== null && v !== undefined && (best === null || v < best)) best = v;
+        });
+        return best;
+    }
 
+    rows.sort(function(a, b) {
         if (cpkSortOrder === "NAME") {
             return a.name.localeCompare(b.name, undefined, { numeric: true });
         }
-
         const x = minCpk(a), y = minCpk(b);
-
-        // Items without a Cpk value always go last.
         if (x === null && y === null) return 0;
         if (x === null) return 1;
         if (y === null) return -1;
-
         return cpkSortOrder === "CPK_DESC" ? y - x : x - y;
     });
 
     return {
+        view: view,
         labels: labels,
         rows: rows,
-        totalItems: allRows.length,
+        totalItems: totalItems,
+        hasUpper: hasUpper,
         mode: cpkModeFilter,
         sort: cpkSortOrder
     };
@@ -3412,6 +3525,11 @@ function setCpkSort(value) {
     renderCpkSummary();
 }
 
+function setCpkView(value) {
+    cpkViewMode = value;
+    renderCpkSummary();
+}
+
 function renderCpkSummary() {
 
     const box = document.getElementById("cpkSummary");
@@ -3425,11 +3543,11 @@ function renderCpkSummary() {
         return;
     }
 
-    const single = data.labels.length === 1;
+    const isTotal = data.view === "TOTAL";
     const showType = data.mode === "BOTH";
 
     function esc(t) {
-        return String(t).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+        return String(t).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
     }
 
     function options(labelMap, current) {
@@ -3439,30 +3557,39 @@ function renderCpkSummary() {
         }).join("");
     }
 
+    const groupWord = data.view === "BATCH" ? "batches" : data.view === "FIXTURE" ? "fixtures" : "";
+
     let html =
         '<div class="cpk-head">' +
             '<div class="cpk-title">Cpk by MTF item</div>' +
             '<div class="cpk-controls">' +
+                '<label>View <select id="cpkViewSelect" onchange="setCpkView(this.value)">' +
+                    options(CPK_VIEW_LABELS, data.view) + '</select></label>' +
                 '<label>Mode <select id="cpkModeSelect" onchange="setCpkMode(this.value)">' +
                     options(CPK_MODE_LABELS, data.mode) + '</select></label>' +
                 '<label>Sort <select id="cpkSortSelect" onchange="setCpkSort(this.value)">' +
                     options(CPK_SORT_LABELS, data.sort) + '</select></label>' +
             '</div>' +
         '</div>' +
-        '<div class="cpk-note">Values are read from the "Cpk" row of the CSV (not recalculated). ' +
+        '<div class="cpk-note">Calculated from the uploaded data: Cpk = min((mean &minus; Lower) / 3&sigma;, (Upper &minus; mean) / 3&sigma;). ' +
         'Red &lt; 1.00, amber &lt; 1.33, green &ge; 1.33. ' +
         'Showing ' + data.rows.length + ' of ' + data.totalItems + ' items (' +
-        esc(CPK_MODE_LABELS[data.mode]) + ').</div>' +
+        esc(CPK_MODE_LABELS[data.mode]) + ')' +
+        (groupWord ? ', ' + data.labels.length + ' ' + groupWord + '. Hover a value to see n, mean and &sigma;' : '') +
+        '.</div>' +
         '<div class="cpk-scroll"><table class="cpk-table"><thead><tr><th>MTF Item</th>';
 
     if (showType) html += '<th>Mode</th>';
     html += '<th class="num">Lower Limit</th>';
+    if (data.hasUpper) html += '<th class="num">Upper Limit</th>';
 
-    if (single) html += '<th class="num">Mean</th><th class="num">Sigma</th>';
-
-    data.labels.forEach(function(label) {
-        html += '<th class="num">Cpk' + (single ? '' : ' - ' + esc(label)) + '</th>';
-    });
+    if (isTotal) {
+        html += '<th class="num">n</th><th class="num">Mean</th><th class="num">Sigma</th><th class="num">Cpk</th>';
+    } else {
+        data.labels.forEach(function(label) {
+            html += '<th class="num">' + esc(label) + '</th>';
+        });
+    }
     html += '</tr></thead><tbody>';
 
     if (!data.rows.length) {
@@ -3473,11 +3600,25 @@ function renderCpkSummary() {
         html += '<tr><td>' + esc(row.name) + '</td>';
         if (showType) html += '<td>' + (row.type === "NIGHT" ? "Night" : "Day") + '</td>';
         html += '<td class="num">' + fmtCpk(row.lower, 1) + '</td>';
-        if (single) html += '<td class="num">' + fmtCpk(row.mean, 2) + '</td><td class="num">' + fmtCpk(row.sigma, 2) + '</td>';
-        data.labels.forEach(function(label) {
-            const v = row.cpk[label];
+        if (data.hasUpper) html += '<td class="num">' + fmtCpk(row.upper, 1) + '</td>';
+
+        if (isTotal) {
+            const st = row.stats[data.labels[0]] || {};
+            html += '<td class="num">' + (st.n === undefined ? "-" : st.n) + '</td>';
+            html += '<td class="num">' + fmtCpk(st.mean, 2) + '</td>';
+            html += '<td class="num">' + fmtCpk(st.sigma, 2) + '</td>';
+            const v = row.cpk[data.labels[0]];
             html += '<td class="num ' + cpkClass(v) + '">' + fmtCpk(v) + '</td>';
-        });
+        } else {
+            data.labels.forEach(function(label) {
+                const v = row.cpk[label];
+                const st = row.stats[label];
+                const tip = st
+                    ? 'n=' + st.n + ', mean=' + fmtCpk(st.mean, 2) + ', sigma=' + fmtCpk(st.sigma, 2)
+                    : 'no data';
+                html += '<td class="num ' + cpkClass(v) + '" title="' + esc(tip) + '">' + fmtCpk(v) + '</td>';
+            });
+        }
         html += '</tr>';
     });
 
@@ -7802,22 +7943,58 @@ document.addEventListener("DOMContentLoaded", function () {
     ------------------------------------------------------------ */
 
     function buildCpkExport() {
-        const data = getCpkTableData();
-        if (!data) return null;
+
+        const total = getCpkTableData("TOTAL");
+        if (!total) return null;
+
+        const fixture = getCpkTableData("FIXTURE");
+        const totalLabel = total.labels[0];
+
+        const totalRows = total.rows.map(function (row) {
+            const st = row.stats[totalLabel] || {};
+            return {
+                item: row.name,
+                mode: row.type === "NIGHT" ? "Night" : "Day",
+                lowerLimit: row.lower,
+                upperLimit: row.upper,
+                n: st.n === undefined ? null : st.n,
+                mean: st.mean === undefined ? null : st.mean,
+                sigma: st.sigma === undefined ? null : st.sigma,
+                cpk: st.cpk === undefined ? null : st.cpk
+            };
+        });
+
+        /* Same item order as the Total table so the two sections line up. */
+        const fixtureByItem = {};
+        if (fixture) fixture.rows.forEach(function (row) { fixtureByItem[row.name] = row; });
+
+        const fixtureRows = [];
+        total.rows.forEach(function (trow) {
+            const row = fixtureByItem[trow.name];
+            if (!row) return;
+            const n = {};
+            fixture.labels.forEach(function (label) {
+                n[label] = row.stats[label] ? row.stats[label].n : null;
+            });
+            fixtureRows.push({
+                item: row.name,
+                mode: row.type === "NIGHT" ? "Night" : "Day",
+                lowerLimit: row.lower,
+                upperLimit: row.upper,
+                cpk: row.cpk,
+                n: n
+            });
+        });
+
         return {
-            mode: CPK_MODE_LABELS[data.mode],
-            sort: CPK_SORT_LABELS[data.sort],
-            sources: data.labels,
-            rows: data.rows.map(function (row) {
-                return {
-                    item: row.name,
-                    mode: row.type === "NIGHT" ? "Night" : "Day",
-                    lowerLimit: row.lower,
-                    mean: row.mean,
-                    sigma: row.sigma,
-                    cpk: row.cpk
-                };
-            })
+            formula: "Calculated from the uploaded data: Cpk = min((mean - Lower) / 3 sigma, (Upper - mean) / 3 sigma)",
+            mode: CPK_MODE_LABELS[total.mode],
+            sort: CPK_SORT_LABELS[total.sort],
+            total: { rows: totalRows },
+            perFixture: {
+                fixtures: fixture ? fixture.labels : [],
+                rows: fixtureRows
+            }
         };
     }
 
@@ -8124,7 +8301,7 @@ document.addEventListener("DOMContentLoaded", function () {
      * Sheet 1: every loaded record (one row per test), measurement
      * columns ordered Day Mode first, then Night Mode.
      */
-    function buildRawDataSheet(records, statsBySource) {
+    function buildRawDataSheet(records) {
 
         const typeByItem = {};
         records.forEach(function (rec) {
@@ -8148,34 +8325,6 @@ document.addEventListener("DOMContentLoaded", function () {
         );
 
         const rows = [header];
-
-        /*
-         * Statistic rows exactly as exported in the CSV (Lower, Upper,
-         * MIN, MAX, Mean, Sigma, CpL, CpU, Cpk), placed under the same
-         * Day -> Night columns. One block per CSV file, right under the
-         * header like in the original CSV.
-         */
-        const STAT_ROWS = [
-            ["Lower", "lower"], ["Upper", "upper"], ["MIN", "min"], ["MAX", "max"],
-            ["Mean", "mean"], ["Sigma", "sigma"], ["CpL", "cpl"], ["CpU", "cpu"], ["Cpk", "cpk"]
-        ];
-
-        Object.keys(statsBySource || {}).forEach(function (label) {
-
-            const byName = {};
-            statsBySource[label].forEach(function (item) { byName[item.name] = item; });
-
-            STAT_ROWS.forEach(function (stat) {
-                const row = [{ v: stat[0], s: XS.BOLD }, "-", "-", "-", label];
-                ordered.forEach(function (n) {
-                    const item = byName[n];
-                    if (!item) { row.push(""); return; }
-                    const v = item[stat[1]];
-                    row.push(v === null || v === undefined ? "-" : v);
-                });
-                rows.push(row);
-            });
-        });
 
         records.forEach(function (rec) {
             const values = {};
@@ -8238,31 +8387,53 @@ document.addEventListener("DOMContentLoaded", function () {
         });
         rows.push([]);
 
+        let summaryCols = 8;
+
         if (summary.cpk) {
-            rows.push([{ v: "CPK BY MTF ITEM (read from CSV)", s: XS.BOLD }]);
-            rows.push([{ v: "Cpk Mode", s: XS.BOLD }, summary.cpk.mode]);
-            rows.push([{ v: "Cpk Sort", s: XS.BOLD }, summary.cpk.sort]);
-            rows.push(head(["Item", "Mode", "Lower Limit"].concat(
-                summary.cpk.sources.map(function (src) {
-                    return summary.cpk.sources.length > 1 ? "Cpk - " + src : "Cpk";
-                })
-            )));
-            summary.cpk.rows.forEach(function (row) {
-                const cells = [row.item, row.mode, row.lowerLimit];
-                summary.cpk.sources.forEach(function (src) {
-                    const v = row.cpk[src];
-                    if (v === null || v === undefined) { cells.push(""); return; }
-                    const cls = cpkClass(v);
-                    cells.push({ v: v, s: cls === "cpk-bad" ? XS.BAD : cls === "cpk-warn" ? XS.WARN : XS.OK });
+
+            const c = summary.cpk;
+
+            function num(v, d) {
+                return (v === null || v === undefined) ? "" : Number(Number(v).toFixed(d));
+            }
+            function cpkCell(v) {
+                if (v === null || v === undefined) return "";
+                const cls = cpkClass(v);
+                return { v: Number(Number(v).toFixed(3)), s: cls === "cpk-bad" ? XS.BAD : cls === "cpk-warn" ? XS.WARN : XS.OK };
+            }
+
+            rows.push([{ v: "TOTAL CPK BY MTF ITEM (calculated from uploaded data)", s: XS.BOLD }]);
+            rows.push([{ v: "Cpk Mode", s: XS.BOLD }, c.mode]);
+            rows.push([{ v: "Cpk Sort", s: XS.BOLD }, c.sort]);
+            rows.push([{ v: "Formula", s: XS.BOLD }, c.formula]);
+            rows.push(head(["Item", "Mode", "Lower Limit", "Upper Limit", "Samples (n)", "Mean", "Sigma", "Cpk"]));
+            c.total.rows.forEach(function (row) {
+                rows.push([
+                    row.item, row.mode,
+                    num(row.lowerLimit, 4), num(row.upperLimit, 4),
+                    num(row.n, 0), num(row.mean, 4), num(row.sigma, 4),
+                    cpkCell(row.cpk)
+                ]);
+            });
+            rows.push([]);
+
+            rows.push([{ v: "CPK PER FIXTURE (all batches combined)", s: XS.BOLD }]);
+            rows.push(head(["Item", "Mode", "Lower Limit"].concat(c.perFixture.fixtures)));
+            c.perFixture.rows.forEach(function (row) {
+                const cells = [row.item, row.mode, num(row.lowerLimit, 4)];
+                c.perFixture.fixtures.forEach(function (fx) {
+                    cells.push(cpkCell(row.cpk[fx]));
                 });
                 rows.push(cells);
             });
+
+            summaryCols = Math.max(8, 3 + c.perFixture.fixtures.length);
         }
 
         return {
             name: "Summary",
             rows: rows,
-            colWidths: [38, 24, 14, 16, 16, 16]
+            colWidths: [38, 24, 14].concat(new Array(summaryCols - 3).fill(16))
         };
     }
 
@@ -8271,7 +8442,7 @@ document.addEventListener("DOMContentLoaded", function () {
         const summary = buildDataSummary();
         const records = (allParsedRecords && allParsedRecords.length) ? allParsedRecords : (originalRecords || []);
 
-        const bytes = buildXlsx([buildRawDataSheet(records, cpkBySource), buildSummarySheet(summary)]);
+        const bytes = buildXlsx([buildRawDataSheet(records), buildSummarySheet(summary)]);
 
         triggerDownload(
             "focus-test-data-export.xlsx",
@@ -8438,18 +8609,29 @@ document.addEventListener("DOMContentLoaded", function () {
         }
 
         if (summary.cpk) {
-            addHeading("Cpk by MTF Item (read from CSV) - " + summary.cpk.mode + ", " + summary.cpk.sort);
+
+            const c = summary.cpk;
+            const dash = function (v, d) {
+                return (v === null || v === undefined) ? "-" : (d === undefined ? v : Number(v).toFixed(d));
+            };
+
+            addHeading("Total Cpk by MTF Item (calculated) - " + c.mode + ", " + c.sort);
             addTable(
-                ["Item", "Mode", "Lower Limit"].concat(
-                    summary.cpk.sources.map(function (src) {
-                        return summary.cpk.sources.length > 1 ? "Cpk - " + src : "Cpk";
-                    })
-                ),
-                summary.cpk.rows.map(function (row) {
-                    return [row.item, row.mode, row.lowerLimit === null ? "-" : row.lowerLimit].concat(
-                        summary.cpk.sources.map(function (src) {
-                            return row.cpk[src] === null || row.cpk[src] === undefined ? "-" : row.cpk[src];
-                        })
+                ["Item", "Mode", "Lower Limit", "Upper Limit", "n", "Mean", "Sigma", "Cpk"],
+                c.total.rows.map(function (row) {
+                    return [
+                        row.item, row.mode, dash(row.lowerLimit), dash(row.upperLimit),
+                        dash(row.n), dash(row.mean, 2), dash(row.sigma, 2), dash(row.cpk, 3)
+                    ];
+                })
+            );
+
+            addHeading("Cpk per Fixture (all batches combined)");
+            addTable(
+                ["Item", "Mode", "Lower Limit"].concat(c.perFixture.fixtures),
+                c.perFixture.rows.map(function (row) {
+                    return [row.item, row.mode, dash(row.lowerLimit)].concat(
+                        c.perFixture.fixtures.map(function (fx) { return dash(row.cpk[fx], 3); })
                     );
                 })
             );
@@ -8458,8 +8640,8 @@ document.addEventListener("DOMContentLoaded", function () {
         const note = document.createElement("div");
         note.style.cssText = "margin-top:14px; font-size:12px; color:#6b7280;";
         note.textContent =
-            "The Excel file has 2 sheets: Raw Data (all loaded records, Day Mode columns then " +
-            "Night Mode columns, with the CSV's Lower/Upper/MIN/MAX/Mean/Sigma/CpL/CpU/Cpk rows under the header) and this Summary.";
+            "The Excel file has 2 sheets: Raw Data (all loaded records, one header row, Day Mode columns then " +
+            "Night Mode columns) and this Summary (Total Cpk first, then Cpk per fixture - calculated from the uploaded data).";
         body.appendChild(note);
 
     }
